@@ -1,0 +1,50 @@
+name: Despliegue de CloudFormation Demo
+
+#Configuracion de las acciones a realizar cuando exista un cambio
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '/Cloudformation/cf-arquitectura.yml'      
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: webapp-demo
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Desplegar CloudFormation (Deploy/Update)
+        run: |
+          aws cloudformation deploy \
+            --region ${{ env.AWS_REGION }} \
+            --template-file Cloudformation/cf-arquitectura.yml\
+            --stack-name ${{ env.STACK_NAME }} \
+            --parameter-overrides DBPassword="secrets.$DB_PASSWORD_SECRET" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+        
+          echo "Despliegue iniciado para la Stack: ${{ env.STACK_NAME }}"
+          
+          echo "Esperando..."
+          aws cloudformation wait stack-update-complete --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} || \
+          aws cloudformation wait stack-create-complete --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }}
+          
+          aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].Outputs" \
+            --output table

@@ -1,0 +1,487 @@
+#Se realiará la creación de un archivo index que muestre una cadena de texto en un servidor simple de apache en AmazonLinux
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Aplicación Web Demo creando una arquitectura a medida.
+
+Parameters:
+  VPCCidr:
+    Description: Rango CIDR para la VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnet1Cidr:
+    Description: Rango CIDR para la Subred Pública 1
+    Type: String
+    Default: 10.0.1.0/24
+  PublicSubnet2Cidr:
+    Description: Rango CIDR para la Subred Pública 2
+    Type: String
+    Default: 10.0.2.0/24
+  PrivateSubnet1Cidr:
+    Description: Rango CIDR para la Subred Privada 1
+    Type: String
+    Default: 10.0.3.0/24
+  PrivateSubnet2Cidr:
+    Description: Rango CIDR para la Subred Privada 2
+    Type: String
+    Default: 10.0.4.0/24
+  DBPassword:
+    Type: String
+    Description: Contrasenia para el RDS de mysql.
+    NoEcho: true  # Se asegura que cuando ingresen al cloudformation la clave no se vea posteriormente
+    MinLength: 8
+    ConstraintDescription: Debe contener al menos 8 caracteres.
+Mappings:
+  # Mapeo de AMI para Amazon Linux 2 (AMD64)
+  AWSRegionMap:
+    us-east-1:
+      AMI: "ami-0fa3fe0fa7920f68e"
+    us-east-2:
+      AMI: "ami-0f59452d3a484c6d6"
+    us-west-2:
+      AMI: "ami-03d3f2385419d2617"
+Resources:
+  #CREACION DE REDES
+  #Generación de VPC haciendo uso del estándar RFC1918
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr 
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igtw'
+  #Asignación del internet Gateway a la VPC creada
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  # Se hace uso del primer segmento en el CIDR para ordenamiento, cabe mencionar que si el área de red cuenta con un estándar definido, es posible adaptarse a el a tráves de esos parametros
+  # Se generan las dos subnets publicas para redundancia
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      #Se coloca por defecto que se encuentre en la Zona de disponibilidad A
+      AvailabilityZone: !Select [0, !GetAZs ''] 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-a'
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      #Se coloca por defecto que se encuentre en la Zona de disponibilidad B
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-b'
+  #Se generan dos subunets privadas para redundancia
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ''] # AZ 'a'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-a'
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ''] # AZ 'b'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-b'
+  # Se crea Ip estatica para el natgateway
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  #Se crea el NAT gateway estableciendo que se encuentre en una subnet publica y utilice una ip estatica
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NAT-GW'
+  #Se crea la tabla de rutas que se encargara de direccionara el trafico, se asocia a la VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Public-RT'
+  # Uno de los puntos mas importantes es asignar que en la tabla de rutas cuando se identifique tráfico al 0.0.0.0/0 vaya al internet gateway para poder salir a internet
+  PublicRoute:
+    Type: AWS::EC2::Route
+    #Con esta regla se verifica que exista el recurso que asocio la vpc al internet gateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  # Se asocia la tabla de ruta a la subnet
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  # Se asocia la tabla de ruta a la subnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  # Se crea la tabla de rutas para las subredes internas
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-RT'
+  # Se crea una ruta que al momento que detecte trafico a internet lo envie al natgateway
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  #Se realiza la asociacion de la subred privada-a a la tabla de rutas privada
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  #Se realiza la asociacion de la subred privada-b a la tabla de rutas privada
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+  #CREACION DE SERVICIOS
+  IAMRoleEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Con la finalidad de no permitir ingresos por otra via se habilita el SesionManager, se agrega cloudwatch para poder hacer uso del servicio, se utilizan politicas administradas por aws
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2WebApp-Role'
+  #Se generar un perfil para EC2 con la finalidad de que cuando se haga uso del autoscaling tome el mismo perfil con el que se creo, haciendo uso de los permisos establecidos en el rol
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref IAMRoleEC2
+  #Se crean los recursos utilizados por EC2
+    # Security group para balanceador
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow HTTP from Internet'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ALB-SG'
+  #Security Group
+  EC2WebAppSG:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: 'Security group for EC2 instances'
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup # Referencia al SG del balanceador
+        Tags:
+          - Key: Name
+            Value: !Sub '${AWS::StackName}-EC2-WebApp-SG' 
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-WebAppLT'
+      LaunchTemplateData:
+        ImageId: !FindInMap [AWSRegionMap, !Ref 'AWS::Region', AMI]
+        InstanceType: t3.micro
+        SecurityGroupIds:
+          - !Ref EC2WebAppSG
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        # Instalacion de docker y una imagn
+        UserData: !Base64 |
+          #!/bin/bash
+          echo "Starting UserData execution"
+          
+          yum update -y
+          yum install docker -y
+          systemctl start docker
+          systemctl enable docker
+          usermod -aG docker ec2-user
+          
+          sleep 10
+          docker run -d -p 80:80 --name apache-server --restart=always httpd:latest
+          
+          echo "UserData execution completed"
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-TargetGroup'
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: "/"
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-TargeGroup'
+  # Grupo de AutoScaling
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        # Se despliega en las subredes PRIVADAS
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '2'
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2-WebApp'
+          PropagateAtLaunch: true
+
+  #Se crean los recursos utilizados por RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow MySQL from EC2 instances'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2WebAppSG # Referencia al SG de EC2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-RDS-WebApp-SG'
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'Grupo de subnets privadas utilizadas por RDS '
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+  # Se genera la instancia de RDS
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: dbwebappdemo
+      Engine: mysql
+      EngineVersion: '8.4.7' # Versión compatible con AWS RDS
+      #Utiliza el parametro de ingreso
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBInstanceClass: db.t3.micro # Elegible para Free Tier
+      AllocatedStorage: '20'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false # Se coloca falso ya que se busca que solo accedan de las subredes privadas
+      StorageType: gp2
+      BackupRetentionPeriod: 0 # No se habilita por costos de demostracion, es recomendable que se cuente con el backup habilitado
+      DeleteAutomatedBackups: true
+      DeletionProtection: false # En ambientes productivos se debe habilitar para evitar que se borre por el cloudformation
+      MultiAZ: false # Se deshabilita por tema de costos
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-RDS'
+  S3LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Logs'
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowElbAccessLogs
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref S3LogsBucket
+                - "/AWSLogs/"
+                - !Ref "AWS::AccountId"
+                - "/*"
+          - Sid: AllowElbGetAclCheck
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub 'arn:aws:s3:::${S3LogsBucket}'
+
+  # Creacion de recursos utilizaods por el balanceador de carga 
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-ALB'
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      # Se crea el balanceador en redes publicas
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      #Se envian los logs a s3
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref S3LogsBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ALB'
+
+  # "Oyente" del ALB en el puerto 80
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      # Acción por defecto: reenviar tráfico al Target Group
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+ #Dashboard de cloudwatch
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroup}", { "label": "CPU EC2 (ASG)" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EC2 CPU Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}", "TargetGroup", "${TargetGroup.TargetGroupFullName}", { "label": "Latencia ALB" } ]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ALB Target Response Time (Latency)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${RDSInstance}", { "label": "Conexiones RDS" } ]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "RDS Database Connections"
+              }
+            }
+          ]
+        }
+Outputs:
+# Es necesario definir una correcta configuración de red para evitar inconvenientes adicionales cuando se intente acceder a internet
+# Por lo que un flujo basico de prueba es que al tener una ec2 en una red privada, a traves de la tabla de rutas privadas se enviará el trafico al nat gateway,
+# este al encontrarse asociado a una subred publica, esta tendrá la capacidad de determinar que el tráfico continua a internet y a tráves de la tabla de rutas publicas,
+# enviara el trafico al internet gateway
+  VPCId:
+    Description: ID de la VPC creada
+    Value: !Ref VPC
+  PublicSubnetIds:
+    Description: IDs de las subredes publicas creadas
+    Value: !Join [",", [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+  PrivateSubnetIds:
+    Description: IDs de las subredes privadas creadas
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  RDSEndpoint:
+    Description: Endpoint de la base de datos RDS
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  S3BucketName:
+    Description: Nombre del bucket S3 para logs y estaticos
+    Value: !Ref S3LogsBucket
